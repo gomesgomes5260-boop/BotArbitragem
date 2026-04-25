@@ -1,6 +1,8 @@
 """Entrypoint do CLI do bot."""
 from __future__ import annotations
 
+import asyncio
+
 import typer
 
 from bot import __version__
@@ -42,6 +44,130 @@ def settings_check() -> None:
     typer.echo("-- Credenciais --")
     typer.echo(f"wallet_configured     = {s.wallet_configured}")
     typer.echo(f"api_configured        = {s.api_configured}")
+
+
+@app.command(name="list-markets")
+def list_markets_cmd(
+    min_volume: float = typer.Option(
+        10000.0, "--min-volume", help="Volume minimo (USDC) para listar."
+    ),
+    max_pages: int = typer.Option(5, "--max-pages", help="Quantas paginas da Gamma API consultar."),
+    limit_display: int = typer.Option(20, "--limit", help="Quantos exibir no terminal."),
+) -> None:
+    """Lista mercados binarios ativos com volume minimo (Gamma API)."""
+    from bot.clients.polymarket_gamma import GammaClient
+
+    async def _run() -> None:
+        async with GammaClient() as gc:
+            markets = await gc.list_active_binary_markets(
+                min_volume=min_volume, max_pages=max_pages
+            )
+        markets.sort(key=lambda m: m.best_volume, reverse=True)
+        typer.echo(f"== {len(markets)} mercados binarios ativos (volume >= {min_volume:.0f}) ==")
+        for m in markets[:limit_display]:
+            cid_short = (m.condition_id or "")[:10] + "..." if m.condition_id else "(no cid)"
+            typer.echo(
+                f"  vol={m.best_volume:>12.0f}  liq={m.liquidity:>10.0f}  {cid_short}  {m.question[:80]}"
+            )
+        if len(markets) > limit_display:
+            typer.echo(f"  ... e mais {len(markets) - limit_display}")
+
+    asyncio.run(_run())
+
+
+@app.command(name="show-book")
+def show_book_cmd(
+    condition_id: str = typer.Argument(..., help="conditionId do mercado (Gamma)."),
+    depth: int = typer.Option(5, "--depth", help="Niveis do book a exibir por lado."),
+) -> None:
+    """Exibe o order book (YES e NO) de um mercado binario."""
+    from bot.clients.polymarket_clob import ClobClient
+    from bot.clients.polymarket_gamma import GammaClient
+
+    async def _run() -> None:
+        async with GammaClient() as gc:
+            market = await gc.get_market(condition_id)
+        if market is None:
+            typer.echo(f"Mercado {condition_id} nao encontrado.")
+            raise typer.Exit(code=1)
+        if not market.is_binary:
+            typer.echo(f"Mercado {condition_id} nao e binario (outcomes={market.outcomes}).")
+            raise typer.Exit(code=1)
+
+        typer.echo(f"== {market.question} ==")
+        typer.echo(f"   slug={market.slug}  vol={market.best_volume:.0f}")
+
+        async with ClobClient() as cc:
+            books = await cc.get_books(market.clob_token_ids)
+
+        labels = market.outcomes if len(market.outcomes) == 2 else ["YES", "NO"]
+        for label, book in zip(labels, books, strict=False):
+            typer.echo(f"\n-- {label}  (asset_id={book.asset_id[:14]}...) --")
+            typer.echo("  ASKS (vendas):")
+            for lvl in sorted(book.asks, key=lambda x: x.price)[:depth]:
+                typer.echo(f"    {lvl.price:>7.4f}  size={lvl.size:.2f}")
+            typer.echo("  BIDS (compras):")
+            for lvl in sorted(book.bids, key=lambda x: x.price, reverse=True)[:depth]:
+                typer.echo(f"    {lvl.price:>7.4f}  size={lvl.size:.2f}")
+            if book.midpoint is not None:
+                typer.echo(f"  midpoint={book.midpoint:.4f}")
+
+        if len(books) == 2:
+            ba_yes = books[0].best_ask
+            ba_no = books[1].best_ask
+            if ba_yes and ba_no:
+                soma = ba_yes.price + ba_no.price
+                typer.echo(
+                    f"\n  best_ask(YES)+best_ask(NO) = {ba_yes.price:.4f} + {ba_no.price:.4f} = {soma:.4f}"
+                )
+                if soma < 1.0:
+                    typer.echo(
+                        f"  >> Possivel arbitragem bruta: {(1.0 - soma) * 100:.2f}% (sem custos)"
+                    )
+
+    asyncio.run(_run())
+
+
+@app.command(name="watch-book")
+def watch_book_cmd(
+    condition_id: str = typer.Argument(..., help="conditionId do mercado para escutar."),
+    duration: int = typer.Option(30, "--duration", help="Segundos antes de desconectar."),
+    max_messages: int = typer.Option(
+        50, "--max-messages", help="Para apos N mensagens (-1 = ilimitado)."
+    ),
+) -> None:
+    """Conecta no WebSocket do CLOB e mostra updates do book em tempo real."""
+    from bot.clients.polymarket_gamma import GammaClient
+    from bot.clients.polymarket_ws import ClobWsClient
+
+    async def _run() -> None:
+        async with GammaClient() as gc:
+            market = await gc.get_market(condition_id)
+        if market is None or not market.is_binary:
+            typer.echo(f"Mercado {condition_id} invalido ou nao binario.")
+            raise typer.Exit(code=1)
+
+        typer.echo(f"Escutando WS de '{market.question[:80]}'...")
+        typer.echo(f"  token_ids: {market.clob_token_ids}")
+
+        ws = ClobWsClient()
+        cap = None if max_messages < 0 else max_messages
+
+        async def consume() -> None:
+            count = 0
+            async for ev in ws.events(market.clob_token_ids, max_messages=cap):
+                etype = ev.get("event_type", "?")
+                aid = (ev.get("asset_id") or "?")[:14]
+                ts = ev.get("timestamp", "?")
+                count += 1
+                typer.echo(f"  #{count:03d}  type={etype:14s} asset={aid}... ts={ts}")
+
+        try:
+            await asyncio.wait_for(consume(), timeout=duration)
+        except asyncio.TimeoutError:
+            typer.echo(f"\nTimeout de {duration}s atingido.")
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
