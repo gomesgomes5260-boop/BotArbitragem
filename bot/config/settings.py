@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     monthly_vps_usd: float = Field(default=10.0, ge=0.0)
     monthly_other_usd: float = Field(default=0.0, ge=0.0)
 
+    avg_gas_polygon_usd: float = Field(default=0.05, ge=0.0)
+    txs_per_arb: int = Field(default=2, ge=1)
+
     min_net_profit_pct: float = Field(default=0.5, ge=0.0)
 
     log_level: str = "INFO"

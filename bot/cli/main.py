@@ -170,5 +170,172 @@ def watch_book_cmd(
     asyncio.run(_run())
 
 
+@app.command(name="scan")
+def scan_cmd(
+    min_volume: float = typer.Option(
+        10000.0, "--min-volume", help="Volume minimo (USDC) dos mercados a varrer."
+    ),
+    max_markets: int = typer.Option(
+        50, "--max-markets", help="Quantos mercados (top por volume) varrer."
+    ),
+    max_pages: int = typer.Option(5, "--max-pages", help="Paginas Gamma a consultar."),
+    show_all: bool = typer.Option(
+        False, "--show-all", help="Imprime todas as oportunidades, nao so o resumo."
+    ),
+) -> None:
+    """Faz uma passada completa: detecta arbs YES+NO em mercados ativos e grava em SQLite."""
+    from bot.clients.polymarket_clob import ClobClient
+    from bot.clients.polymarket_gamma import GammaClient
+    from bot.config.settings import get_settings
+    from bot.data.opportunity_store import OpportunityStore
+    from bot.economics.cost_model import CostModel
+    from bot.strategies.intra_market import IntraMarketDetector
+    from bot.strategies.scanner import IntraMarketScanner, format_opportunity_line
+
+    settings = get_settings()
+    cost_model = CostModel.from_settings(settings)
+    detector = IntraMarketDetector(cost_model, min_net_profit_pct=settings.min_net_profit_pct)
+
+    store = OpportunityStore(settings.database_path)
+    store.init_schema()
+
+    typer.echo(f"== Scan inicio ==")
+    typer.echo(
+        f"   threshold lucro liquido: {settings.min_net_profit_pct}%   "
+        f"taker_fee={settings.taker_fee_bps}bps   "
+        f"gas_per_tx=${settings.avg_gas_polygon_usd}"
+    )
+
+    async def _run() -> None:
+        async with GammaClient() as gamma, ClobClient() as clob:
+            scanner = IntraMarketScanner(gamma, clob, detector, store)
+            n_cached = await scanner.refresh_cache(min_volume=min_volume, max_pages=max_pages)
+            typer.echo(f"   mercados ativos no cache: {n_cached}")
+
+            result = await scanner.scan_once(max_markets=max_markets)
+            typer.echo(
+                f"   varridos {result.markets_scanned}  ->  "
+                f"{result.opportunities_found} oportunidades"
+            )
+
+            if result.opportunities:
+                result.opportunities.sort(key=lambda o: o.net_pnl_pct, reverse=True)
+                typer.echo("\n  Oportunidades (ordenadas por net_pct):")
+                top = result.opportunities if show_all else result.opportunities[:10]
+                for opp in top:
+                    typer.echo(format_opportunity_line(opp))
+                if not show_all and len(result.opportunities) > 10:
+                    typer.echo(
+                        f"  ... e mais {len(result.opportunities) - 10}. Use --show-all pra ver tudo."
+                    )
+
+    asyncio.run(_run())
+
+
+@app.command(name="monitor")
+def monitor_cmd(
+    min_volume: float = typer.Option(10000.0, "--min-volume"),
+    max_markets: int = typer.Option(50, "--max-markets"),
+    max_pages: int = typer.Option(5, "--max-pages"),
+    interval: float = typer.Option(
+        5.0, "--interval", help="Segundos entre passadas."
+    ),
+    refresh_cache_every: int = typer.Option(
+        20, "--refresh-cache-every", help="Refresca lista de mercados a cada N passadas."
+    ),
+) -> None:
+    """Loop continuo de scan. Ctrl+C pra parar."""
+    from bot.clients.polymarket_clob import ClobClient
+    from bot.clients.polymarket_gamma import GammaClient
+    from bot.config.settings import get_settings
+    from bot.data.opportunity_store import OpportunityStore
+    from bot.economics.cost_model import CostModel
+    from bot.strategies.intra_market import IntraMarketDetector
+    from bot.strategies.scanner import IntraMarketScanner, format_opportunity_line
+
+    settings = get_settings()
+    cost_model = CostModel.from_settings(settings)
+    detector = IntraMarketDetector(cost_model, min_net_profit_pct=settings.min_net_profit_pct)
+
+    store = OpportunityStore(settings.database_path)
+    store.init_schema()
+
+    typer.echo(f"== Monitor iniciando (interval={interval}s, Ctrl+C pra parar) ==")
+
+    async def _run() -> None:
+        async with GammaClient() as gamma, ClobClient() as clob:
+            scanner = IntraMarketScanner(gamma, clob, detector, store)
+            await scanner.refresh_cache(min_volume=min_volume, max_pages=max_pages)
+            typer.echo(f"   {len(scanner.cache.markets)} mercados no cache")
+
+            pass_num = 0
+            try:
+                while True:
+                    pass_num += 1
+                    if pass_num > 1 and (pass_num % refresh_cache_every == 0):
+                        await scanner.refresh_cache(
+                            min_volume=min_volume, max_pages=max_pages
+                        )
+                    result = await scanner.scan_once(max_markets=max_markets)
+
+                    if result.opportunities:
+                        result.opportunities.sort(key=lambda o: o.net_pnl_pct, reverse=True)
+                        typer.echo(
+                            f"[#{pass_num:04d}] {result.opportunities_found} arbs"
+                            f" (top {min(3, len(result.opportunities))}):"
+                        )
+                        for opp in result.opportunities[:3]:
+                            typer.echo(format_opportunity_line(opp))
+                    else:
+                        typer.echo(f"[#{pass_num:04d}] nenhuma arb (varridos {result.markets_scanned})")
+
+                    await asyncio.sleep(interval)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                typer.echo("\nMonitor encerrado.")
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+
+
+@app.command(name="stats")
+def stats_cmd(
+    last_n: int = typer.Option(
+        10, "--last", help="Quantas oportunidades recentes mostrar."
+    ),
+) -> None:
+    """Resumo das oportunidades acumuladas no banco."""
+    from bot.config.settings import get_settings
+    from bot.data.opportunity_store import OpportunityStore
+    from bot.economics.cost_model import CostModel
+
+    settings = get_settings()
+    store = OpportunityStore(settings.database_path)
+    store.init_schema()
+    cost_model = CostModel.from_settings(settings)
+
+    agg = store.aggregate_pnl()
+    typer.echo(f"== Total acumulado ==")
+    typer.echo(f"  oportunidades:       {agg['num_opportunities']}")
+    typer.echo(f"  gross_pnl total:     ${agg['gross_pnl_usdc']:.2f}")
+    typer.echo(f"  fees estimadas:      ${agg['estimated_fees_usdc']:.2f}")
+    typer.echo(f"  gas estimado:        ${agg['estimated_gas_usdc']:.2f}")
+    typer.echo(f"  net_pnl total:       ${agg['net_pnl_usdc']:.2f}")
+    typer.echo(f"  custo fixo diario:   ${cost_model.daily_fixed_cost_usd:.4f}")
+    typer.echo(f"  break-even/dia:      ${cost_model.break_even_daily_pnl():.4f}")
+
+    rows = store.recent_opportunities(limit=last_n)
+    if rows:
+        typer.echo(f"\n== Ultimas {len(rows)} oportunidades ==")
+        for r in rows:
+            ts = r["timestamp_utc"][:19]
+            typer.echo(
+                f"  {ts}  net={r['net_pnl_pct']:>5.2f}%  "
+                f"${r['net_pnl_usdc']:>6.2f}  size=${r['size_max_usdc']:>8.2f}  "
+                f"{(r['market_question'] or '')[:60]}"
+            )
+
+
 if __name__ == "__main__":
     app()
