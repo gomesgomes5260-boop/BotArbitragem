@@ -36,6 +36,8 @@ class Settings(BaseSettings):
 
     min_net_profit_pct: float = Field(default=0.5, ge=0.0)
 
+    paper_capital_per_trade_usdc: float = Field(default=20.0, ge=1.0)
+
     log_level: str = "INFO"
     database_path: Path = Path("data/bot.db")
 

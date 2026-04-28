@@ -14,6 +14,7 @@ from bot.clients.polymarket_clob import ClobClient
 from bot.clients.polymarket_gamma import GammaClient
 from bot.data.market_cache import MarketCache
 from bot.data.opportunity_store import OpportunityRow, OpportunityStore
+from bot.execution.paper_trader import PaperTradeResult, PaperTrader
 from bot.strategies.intra_market import ArbOpportunity, IntraMarketDetector
 
 
@@ -22,6 +23,7 @@ class ScanResult:
     markets_scanned: int
     opportunities_found: int
     opportunities: list[ArbOpportunity]
+    paper_trades: list[PaperTradeResult]
 
 
 def _opportunity_to_row(opp: ArbOpportunity) -> OpportunityRow:
@@ -51,6 +53,7 @@ class IntraMarketScanner:
         *,
         cache: MarketCache | None = None,
         snapshot_writer: SnapshotWriter | None = None,
+        paper_trader: PaperTrader | None = None,
     ) -> None:
         self.gamma = gamma
         self.clob = clob
@@ -58,6 +61,7 @@ class IntraMarketScanner:
         self.store = store
         self.cache = cache or MarketCache()
         self.snapshot_writer = snapshot_writer
+        self.paper_trader = paper_trader
 
     async def refresh_cache(self, *, min_volume: float, max_pages: int = 5) -> int:
         self.cache.min_volume = min_volume
@@ -71,7 +75,9 @@ class IntraMarketScanner:
             markets = markets[:max_markets]
 
         if not markets:
-            return ScanResult(markets_scanned=0, opportunities_found=0, opportunities=[])
+            return ScanResult(
+                markets_scanned=0, opportunities_found=0, opportunities=[], paper_trades=[]
+            )
 
         token_ids: list[str] = []
         for m in markets:
@@ -81,11 +87,14 @@ class IntraMarketScanner:
             books = await self.clob.get_books(token_ids)
         except Exception as exc:  # noqa: BLE001
             logger.error("Falha ao buscar books em batch: {}", exc)
-            return ScanResult(markets_scanned=0, opportunities_found=0, opportunities=[])
+            return ScanResult(
+                markets_scanned=0, opportunities_found=0, opportunities=[], paper_trades=[]
+            )
 
         books_by_id: dict[str, OrderBook] = {b.asset_id: b for b in books}
 
         found: list[ArbOpportunity] = []
+        paper_trades: list[PaperTradeResult] = []
         for market in markets:
             yes_id = market.yes_token_id
             no_id = market.no_token_id
@@ -106,11 +115,20 @@ class IntraMarketScanner:
             if opp is None:
                 continue
             found.append(opp)
+
+            opportunity_id: int | None = None
             if self.store is not None:
                 try:
-                    self.store.insert_opportunity(_opportunity_to_row(opp))
+                    opportunity_id = self.store.insert_opportunity(_opportunity_to_row(opp))
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Falha ao salvar oportunidade {}: {}", market.id, exc)
+
+            if self.paper_trader is not None:
+                try:
+                    trade = self.paper_trader.execute(opp, opportunity_id=opportunity_id)
+                    paper_trades.append(trade)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Falha ao simular paper trade {}: {}", market.id, exc)
 
         if self.snapshot_writer is not None:
             self.snapshot_writer.flush()
@@ -119,6 +137,7 @@ class IntraMarketScanner:
             markets_scanned=len(markets),
             opportunities_found=len(found),
             opportunities=found,
+            paper_trades=paper_trades,
         )
 
 

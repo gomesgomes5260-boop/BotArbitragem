@@ -182,6 +182,12 @@ def scan_cmd(
     show_all: bool = typer.Option(
         False, "--show-all", help="Imprime todas as oportunidades, nao so o resumo."
     ),
+    paper: bool = typer.Option(
+        False, "--paper", help="Simula execucao paper de cada arb detectada."
+    ),
+    paper_capital: float | None = typer.Option(
+        None, "--paper-capital", help="Override do capital por trade (USDC)."
+    ),
 ) -> None:
     """Faz uma passada completa: detecta arbs YES+NO em mercados ativos e grava em SQLite."""
     from bot.clients.polymarket_clob import ClobClient
@@ -189,6 +195,7 @@ def scan_cmd(
     from bot.config.settings import get_settings
     from bot.data.opportunity_store import OpportunityStore
     from bot.economics.cost_model import CostModel
+    from bot.execution.paper_trader import PaperTrader
     from bot.strategies.intra_market import IntraMarketDetector
     from bot.strategies.scanner import IntraMarketScanner, format_opportunity_line
 
@@ -199,16 +206,25 @@ def scan_cmd(
     store = OpportunityStore(settings.database_path)
     store.init_schema()
 
+    paper_trader: PaperTrader | None = None
+    if paper:
+        capital = paper_capital if paper_capital is not None else settings.paper_capital_per_trade_usdc
+        paper_trader = PaperTrader(cost_model, store, capital_per_trade_usdc=capital)
+
     typer.echo(f"== Scan inicio ==")
     typer.echo(
         f"   threshold lucro liquido: {settings.min_net_profit_pct}%   "
         f"taker_fee={settings.taker_fee_bps}bps   "
         f"gas_per_tx=${settings.avg_gas_polygon_usd}"
     )
+    if paper_trader is not None:
+        typer.echo(f"   paper trading ON, capital ${paper_trader.capital_per_trade_usdc:.2f}/trade")
 
     async def _run() -> None:
         async with GammaClient() as gamma, ClobClient() as clob:
-            scanner = IntraMarketScanner(gamma, clob, detector, store)
+            scanner = IntraMarketScanner(
+                gamma, clob, detector, store, paper_trader=paper_trader
+            )
             n_cached = await scanner.refresh_cache(min_volume=min_volume, max_pages=max_pages)
             typer.echo(f"   mercados ativos no cache: {n_cached}")
 
@@ -229,6 +245,15 @@ def scan_cmd(
                         f"  ... e mais {len(result.opportunities) - 10}. Use --show-all pra ver tudo."
                     )
 
+            if result.paper_trades:
+                typer.echo(f"\n  Paper trades simulados: {len(result.paper_trades)}")
+                for t in result.paper_trades:
+                    typer.echo(
+                        f"    [{t.leg_status:13s}] net=${t.net_pnl_usdc:>6.2f}  "
+                        f"size=${t.total_usdc_spent:>6.2f}  "
+                        f"{t.opportunity.market.question[:50]}"
+                    )
+
     asyncio.run(_run())
 
 
@@ -246,6 +271,12 @@ def monitor_cmd(
     snapshot_dir: str | None = typer.Option(
         None, "--snapshot-dir", help="Diretorio onde gravar snapshots JSONL para replay."
     ),
+    paper: bool = typer.Option(
+        False, "--paper", help="Simula execucao paper de cada arb detectada."
+    ),
+    paper_capital: float | None = typer.Option(
+        None, "--paper-capital", help="Override do capital por trade (USDC)."
+    ),
 ) -> None:
     """Loop continuo de scan. Ctrl+C pra parar."""
     from bot.backtest.snapshot import SnapshotWriter
@@ -254,6 +285,7 @@ def monitor_cmd(
     from bot.config.settings import get_settings
     from bot.data.opportunity_store import OpportunityStore
     from bot.economics.cost_model import CostModel
+    from bot.execution.paper_trader import PaperTrader
     from bot.strategies.intra_market import IntraMarketDetector
     from bot.strategies.scanner import IntraMarketScanner, format_opportunity_line
 
@@ -264,9 +296,16 @@ def monitor_cmd(
     store = OpportunityStore(settings.database_path)
     store.init_schema()
 
+    paper_trader: PaperTrader | None = None
+    if paper:
+        capital = paper_capital if paper_capital is not None else settings.paper_capital_per_trade_usdc
+        paper_trader = PaperTrader(cost_model, store, capital_per_trade_usdc=capital)
+
     typer.echo(f"== Monitor iniciando (interval={interval}s, Ctrl+C pra parar) ==")
     if snapshot_dir is not None:
         typer.echo(f"   gravando snapshots em {snapshot_dir}/")
+    if paper_trader is not None:
+        typer.echo(f"   paper trading ON, capital ${paper_trader.capital_per_trade_usdc:.2f}/trade")
 
     async def _run() -> None:
         writer_ctx = SnapshotWriter(snapshot_dir) if snapshot_dir else None
@@ -275,7 +314,12 @@ def monitor_cmd(
                 if writer_ctx is not None:
                     writer_ctx.__enter__()
                 scanner = IntraMarketScanner(
-                    gamma, clob, detector, store, snapshot_writer=writer_ctx
+                    gamma,
+                    clob,
+                    detector,
+                    store,
+                    snapshot_writer=writer_ctx,
+                    paper_trader=paper_trader,
                 )
                 await scanner.refresh_cache(min_volume=min_volume, max_pages=max_pages)
                 typer.echo(f"   {len(scanner.cache.markets)} mercados no cache")
@@ -440,6 +484,44 @@ def stats_cmd(
                 f"  {ts}  net={r['net_pnl_pct']:>5.2f}%  "
                 f"${r['net_pnl_usdc']:>6.2f}  size=${r['size_max_usdc']:>8.2f}  "
                 f"{(r['market_question'] or '')[:60]}"
+            )
+
+
+@app.command(name="pnl")
+def pnl_cmd(
+    period: str = typer.Option("all", "--period", help="'1d' | '7d' | '30d' | 'all'"),
+    mode: str | None = typer.Option(
+        None, "--mode", help="'paper' | 'live'. Padrao: ambos."
+    ),
+    last_trades: int = typer.Option(
+        10, "--last", help="Quantos trades recentes mostrar."
+    ),
+) -> None:
+    """Relatorio de P&L consolidado (trades reais + custos fixos)."""
+    from bot.config.settings import get_settings
+    from bot.data.opportunity_store import OpportunityStore
+    from bot.economics.cost_model import CostModel
+    from bot.monitoring.pnl_report import build_report, format_report
+
+    settings = get_settings()
+    store = OpportunityStore(settings.database_path)
+    store.init_schema()
+    cost_model = CostModel.from_settings(settings)
+
+    report = build_report(store, cost_model, period=period, mode=mode)
+    for line in format_report(report):
+        typer.echo(line)
+
+    rows = store.recent_trades(mode=mode, limit=last_trades)
+    if rows:
+        typer.echo("")
+        typer.echo(f"== Ultimos {len(rows)} trades ==")
+        for r in rows:
+            ts = r["timestamp_utc"][:19]
+            typer.echo(
+                f"  {ts}  {r['mode']:5s}  {r['leg_status']:13s}  "
+                f"net=${r['net_pnl_usdc']:>6.2f}  size=${r['size_usdc']:>7.2f}  "
+                f"market={r['market_id']}"
             )
 
 

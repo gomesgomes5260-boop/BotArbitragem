@@ -18,7 +18,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:
+    from bot.execution.paper_trader import PaperTradeResult
 
 
 SCHEMA_SQL = """
@@ -158,6 +161,143 @@ class OpportunityStore:
                 ),
             )
             return cur.lastrowid or 0
+
+    def insert_trade(
+        self,
+        result: "PaperTradeResult",
+        *,
+        opportunity_id: int | None = None,
+        mode: str = "paper",
+        timestamp_utc: str | None = None,
+    ) -> int:
+        """Insere uma execucao (paper ou live).
+
+        Tambem marca a oportunidade vinculada como `was_traded=1`.
+        """
+        if mode not in ("paper", "live"):
+            raise ValueError(f"mode invalido: {mode}")
+        ts = timestamp_utc or datetime.now(timezone.utc).isoformat()
+
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO trades (
+                    opportunity_id, timestamp_utc, mode, market_id, size_usdc,
+                    fill_price_yes, fill_price_no, realized_gross_pnl_usdc,
+                    taker_fee_paid_usdc, maker_fee_paid_usdc,
+                    gas_paid_usdc, matic_price_at_trade, net_pnl_usdc,
+                    leg_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    opportunity_id,
+                    ts,
+                    mode,
+                    result.opportunity.market.id,
+                    result.total_usdc_spent,
+                    result.yes_fill.avg_fill_price or None,
+                    result.no_fill.avg_fill_price or None,
+                    result.realized_gross_pnl_usdc,
+                    result.fees_paid_usdc,
+                    0.0,
+                    result.gas_paid_usdc,
+                    None,
+                    result.net_pnl_usdc,
+                    result.leg_status,
+                ),
+            )
+            trade_id = cur.lastrowid or 0
+
+            if opportunity_id is not None:
+                conn.execute(
+                    "UPDATE opportunities SET was_traded = 1 WHERE id = ?",
+                    (opportunity_id,),
+                )
+
+        return trade_id
+
+    def count_trades(self, *, mode: str | None = None) -> int:
+        with self._connect() as conn:
+            if mode is None:
+                cur = conn.execute("SELECT COUNT(*) AS n FROM trades")
+            else:
+                cur = conn.execute("SELECT COUNT(*) AS n FROM trades WHERE mode = ?", (mode,))
+            return int(cur.fetchone()["n"])
+
+    def aggregate_trades(
+        self, *, mode: str | None = None, since_iso: str | None = None
+    ) -> dict[str, float | int]:
+        """Soma metricas reais de execucao (paper ou live)."""
+        clauses: list[str] = []
+        params: list = []
+        if mode is not None:
+            clauses.append("mode = ?")
+            params.append(mode)
+        if since_iso is not None:
+            clauses.append("timestamp_utc >= ?")
+            params.append(since_iso)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS n,
+                    COALESCE(SUM(size_usdc), 0) AS notional,
+                    COALESCE(SUM(realized_gross_pnl_usdc), 0) AS gross,
+                    COALESCE(SUM(taker_fee_paid_usdc), 0) AS taker_fees,
+                    COALESCE(SUM(maker_fee_paid_usdc), 0) AS maker_fees,
+                    COALESCE(SUM(gas_paid_usdc), 0) AS gas,
+                    COALESCE(SUM(net_pnl_usdc), 0) AS net,
+                    SUM(CASE WHEN net_pnl_usdc > 0 THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN leg_status = 'both_filled' THEN 1 ELSE 0 END) AS full_fills
+                FROM trades {where}
+                """,
+                params,
+            )
+            row = cur.fetchone()
+            return {
+                "num_trades": int(row["n"]),
+                "notional_usdc": float(row["notional"]),
+                "gross_pnl_usdc": float(row["gross"]),
+                "taker_fees_usdc": float(row["taker_fees"]),
+                "maker_fees_usdc": float(row["maker_fees"]),
+                "gas_usdc": float(row["gas"]),
+                "net_pnl_usdc": float(row["net"]),
+                "wins": int(row["wins"] or 0),
+                "full_fills": int(row["full_fills"] or 0),
+            }
+
+    def trades_first_last_ts(
+        self, *, mode: str | None = None
+    ) -> tuple[str | None, str | None]:
+        with self._connect() as conn:
+            if mode is None:
+                cur = conn.execute(
+                    "SELECT MIN(timestamp_utc) AS lo, MAX(timestamp_utc) AS hi FROM trades"
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT MIN(timestamp_utc) AS lo, MAX(timestamp_utc) AS hi FROM trades WHERE mode = ?",
+                    (mode,),
+                )
+            row = cur.fetchone()
+            return row["lo"], row["hi"]
+
+    def recent_trades(
+        self, *, mode: str | None = None, limit: int = 20
+    ) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            if mode is None:
+                cur = conn.execute(
+                    "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT * FROM trades WHERE mode = ? ORDER BY id DESC LIMIT ?",
+                    (mode, limit),
+                )
+            return list(cur.fetchall())
 
     def upsert_daily_cost(
         self,
