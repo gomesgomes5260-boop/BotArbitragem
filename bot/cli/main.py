@@ -243,8 +243,12 @@ def monitor_cmd(
     refresh_cache_every: int = typer.Option(
         20, "--refresh-cache-every", help="Refresca lista de mercados a cada N passadas."
     ),
+    snapshot_dir: str | None = typer.Option(
+        None, "--snapshot-dir", help="Diretorio onde gravar snapshots JSONL para replay."
+    ),
 ) -> None:
     """Loop continuo de scan. Ctrl+C pra parar."""
+    from bot.backtest.snapshot import SnapshotWriter
     from bot.clients.polymarket_clob import ClobClient
     from bot.clients.polymarket_gamma import GammaClient
     from bot.config.settings import get_settings
@@ -261,42 +265,144 @@ def monitor_cmd(
     store.init_schema()
 
     typer.echo(f"== Monitor iniciando (interval={interval}s, Ctrl+C pra parar) ==")
+    if snapshot_dir is not None:
+        typer.echo(f"   gravando snapshots em {snapshot_dir}/")
 
     async def _run() -> None:
+        writer_ctx = SnapshotWriter(snapshot_dir) if snapshot_dir else None
         async with GammaClient() as gamma, ClobClient() as clob:
-            scanner = IntraMarketScanner(gamma, clob, detector, store)
-            await scanner.refresh_cache(min_volume=min_volume, max_pages=max_pages)
-            typer.echo(f"   {len(scanner.cache.markets)} mercados no cache")
-
-            pass_num = 0
             try:
-                while True:
-                    pass_num += 1
-                    if pass_num > 1 and (pass_num % refresh_cache_every == 0):
-                        await scanner.refresh_cache(
-                            min_volume=min_volume, max_pages=max_pages
-                        )
-                    result = await scanner.scan_once(max_markets=max_markets)
+                if writer_ctx is not None:
+                    writer_ctx.__enter__()
+                scanner = IntraMarketScanner(
+                    gamma, clob, detector, store, snapshot_writer=writer_ctx
+                )
+                await scanner.refresh_cache(min_volume=min_volume, max_pages=max_pages)
+                typer.echo(f"   {len(scanner.cache.markets)} mercados no cache")
 
-                    if result.opportunities:
-                        result.opportunities.sort(key=lambda o: o.net_pnl_pct, reverse=True)
-                        typer.echo(
-                            f"[#{pass_num:04d}] {result.opportunities_found} arbs"
-                            f" (top {min(3, len(result.opportunities))}):"
-                        )
-                        for opp in result.opportunities[:3]:
-                            typer.echo(format_opportunity_line(opp))
-                    else:
-                        typer.echo(f"[#{pass_num:04d}] nenhuma arb (varridos {result.markets_scanned})")
+                pass_num = 0
+                try:
+                    while True:
+                        pass_num += 1
+                        if pass_num > 1 and (pass_num % refresh_cache_every == 0):
+                            await scanner.refresh_cache(
+                                min_volume=min_volume, max_pages=max_pages
+                            )
+                        result = await scanner.scan_once(max_markets=max_markets)
 
-                    await asyncio.sleep(interval)
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                typer.echo("\nMonitor encerrado.")
+                        if result.opportunities:
+                            result.opportunities.sort(key=lambda o: o.net_pnl_pct, reverse=True)
+                            typer.echo(
+                                f"[#{pass_num:04d}] {result.opportunities_found} arbs"
+                                f" (top {min(3, len(result.opportunities))}):"
+                            )
+                            for opp in result.opportunities[:3]:
+                                typer.echo(format_opportunity_line(opp))
+                        else:
+                            typer.echo(
+                                f"[#{pass_num:04d}] nenhuma arb (varridos {result.markets_scanned})"
+                            )
+
+                        await asyncio.sleep(interval)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    typer.echo("\nMonitor encerrado.")
+            finally:
+                if writer_ctx is not None:
+                    writer_ctx.close()
 
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
         pass
+
+
+@app.command(name="replay")
+def replay_cmd(
+    path: str = typer.Argument(..., help="Arquivo .jsonl ou diretorio com snapshots."),
+    threshold_pct: float | None = typer.Option(
+        None, "--threshold", help="Override do MIN_NET_PROFIT_PCT pra esta replay."
+    ),
+    taker_fee_bps: int | None = typer.Option(
+        None, "--taker-fee-bps", help="Override do taker fee (bps)."
+    ),
+    gas_per_tx_usd: float | None = typer.Option(
+        None, "--gas-per-tx", help="Override do gas estimado por tx (USD)."
+    ),
+    top_n_markets: int = typer.Option(10, "--top-markets", help="Top mercados a exibir."),
+) -> None:
+    """Replay do detector contra snapshots gravados (Fase 3)."""
+    from pathlib import Path
+
+    from bot.backtest.replay import ReplayRunner
+    from bot.backtest.snapshot import SnapshotReader
+    from bot.config.settings import get_settings
+    from bot.economics.cost_model import CostModel
+    from bot.strategies.intra_market import IntraMarketDetector
+
+    settings = get_settings()
+    cm = CostModel(
+        taker_fee_bps=taker_fee_bps if taker_fee_bps is not None else settings.taker_fee_bps,
+        maker_fee_bps=settings.maker_fee_bps,
+        avg_gas_polygon_usd=(
+            gas_per_tx_usd if gas_per_tx_usd is not None else settings.avg_gas_polygon_usd
+        ),
+        txs_per_arb=settings.txs_per_arb,
+        monthly_rpc_usd=settings.monthly_rpc_usd,
+        monthly_vps_usd=settings.monthly_vps_usd,
+        monthly_other_usd=settings.monthly_other_usd,
+    )
+    threshold = (
+        threshold_pct if threshold_pct is not None else settings.min_net_profit_pct
+    )
+    detector = IntraMarketDetector(cm, min_net_profit_pct=threshold)
+
+    target = Path(path)
+    if not target.exists():
+        typer.echo(f"Arquivo/diretorio nao encontrado: {path}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"== Replay {path} ==")
+    typer.echo(
+        f"   threshold={threshold}%   taker_fee={cm.taker_fee_bps}bps   "
+        f"gas/tx=${cm.avg_gas_polygon_usd}"
+    )
+
+    runner = ReplayRunner(detector)
+    metrics = runner.run(SnapshotReader(target))
+
+    typer.echo(f"   snapshots:       {metrics.snapshots_processed}")
+    typer.echo(f"   com arb:         {metrics.snapshots_with_arb}")
+    typer.echo(f"   detections:      {metrics.detections}")
+    typer.echo(f"   periodo:         {metrics.time_span_days:.2f} dias")
+    typer.echo("")
+    typer.echo(f"   gross:           ${metrics.gross_pnl_usdc:.2f}")
+    typer.echo(f"   fees estimadas:  ${metrics.fees_usdc:.2f}")
+    typer.echo(f"   gas estimado:    ${metrics.gas_usdc:.2f}")
+    typer.echo(f"   net_pnl:         ${metrics.net_pnl_usdc:.2f}")
+    if metrics.time_span_days > 0:
+        typer.echo(f"   net/dia:         ${metrics.net_pnl_usdc / metrics.time_span_days:.4f}")
+    fixed_period = cm.daily_fixed_cost_usd * max(metrics.time_span_days, 1.0)
+    typer.echo(f"   custo fixo:      ${fixed_period:.4f} ({cm.daily_fixed_cost_usd:.4f}/dia)")
+    payback = "SIM" if metrics.net_pnl_usdc > fixed_period else "NAO"
+    typer.echo(f"   paga a infra:    {payback}")
+
+    if metrics.durations_seconds:
+        avg = metrics.avg_duration or 0.0
+        p50 = metrics.duration_quantile(0.50)
+        p95 = metrics.duration_quantile(0.95)
+        typer.echo("")
+        typer.echo(
+            f"   duracao arb:     avg={avg:.1f}s  p50={p50:.1f}s  p95={p95:.1f}s  n={len(metrics.durations_seconds)}"
+        )
+
+    if metrics.per_market:
+        typer.echo("")
+        typer.echo(f"== Top {top_n_markets} mercados (por net_pnl) ==")
+        for ms in metrics.top_markets[:top_n_markets]:
+            typer.echo(
+                f"   net=${ms.net_pnl_usdc:>7.2f}  detections={ms.detections:>4d}  "
+                f"{(ms.question or ms.market_id)[:80]}"
+            )
 
 
 @app.command(name="stats")

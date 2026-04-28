@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from loguru import logger
 
+from bot.backtest.snapshot import SnapshotWriter
 from bot.clients.models import Market, OrderBook
 from bot.clients.polymarket_clob import ClobClient
 from bot.clients.polymarket_gamma import GammaClient
@@ -49,12 +50,14 @@ class IntraMarketScanner:
         store: OpportunityStore | None = None,
         *,
         cache: MarketCache | None = None,
+        snapshot_writer: SnapshotWriter | None = None,
     ) -> None:
         self.gamma = gamma
         self.clob = clob
         self.detector = detector
         self.store = store
         self.cache = cache or MarketCache()
+        self.snapshot_writer = snapshot_writer
 
     async def refresh_cache(self, *, min_volume: float, max_pages: int = 5) -> int:
         self.cache.min_volume = min_volume
@@ -92,6 +95,13 @@ class IntraMarketScanner:
             nb = books_by_id.get(no_id)
             if yb is None or nb is None:
                 continue
+
+            if self.snapshot_writer is not None:
+                try:
+                    self.snapshot_writer.write(market, yb, nb)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Falha ao gravar snapshot {}: {}", market.id, exc)
+
             opp = self.detector.detect(market, yb, nb)
             if opp is None:
                 continue
@@ -101,6 +111,9 @@ class IntraMarketScanner:
                     self.store.insert_opportunity(_opportunity_to_row(opp))
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Falha ao salvar oportunidade {}: {}", market.id, exc)
+
+        if self.snapshot_writer is not None:
+            self.snapshot_writer.flush()
 
         return ScanResult(
             markets_scanned=len(markets),
