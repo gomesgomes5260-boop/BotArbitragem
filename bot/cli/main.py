@@ -525,5 +525,221 @@ def pnl_cmd(
             )
 
 
+CONFIRM_PHRASE = "EU CONFIRMO DINHEIRO REAL"
+
+
+@app.command(name="risk-status")
+def risk_status_cmd() -> None:
+    """Mostra estado de risco: limites, exposure, kill-switch."""
+    from bot.config.settings import get_settings
+    from bot.data.opportunity_store import OpportunityStore
+    from bot.execution.live_trader import get_today_live_exposure, get_today_live_pnl
+    from bot.risk.limits import RiskManager
+
+    settings = get_settings()
+    store = OpportunityStore(settings.database_path)
+    store.init_schema()
+    rm = RiskManager.from_settings(settings)
+
+    summary = rm.status_summary()
+    today_exposure = get_today_live_exposure(store)
+    today_pnl = get_today_live_pnl(store)
+
+    typer.echo("== Risk status ==")
+    typer.echo(f"  kill_switch_active : {summary['kill_switch_active']}")
+    if summary["kill_switch_active"]:
+        typer.echo(f"  kill_switch_reason : {summary['kill_switch_reason']}")
+    typer.echo(f"  kill_switch_path   : {summary['kill_switch_path']}")
+    typer.echo("")
+    typer.echo("  Limits (live):")
+    for k, v in summary["limits"].items():
+        typer.echo(f"    {k} = {v}")
+    typer.echo(f"    hard_cap_per_trade_usdc = {summary['hard_cap_per_trade_usdc']}")
+    typer.echo("")
+    typer.echo("  Hoje (UTC):")
+    typer.echo(f"    exposure (notional): ${today_exposure:.2f}")
+    typer.echo(f"    realized P&L:        ${today_pnl:.2f}")
+
+
+@app.command(name="kill-switch")
+def kill_switch_cmd(
+    reset: bool = typer.Option(False, "--reset", help="Desarma o kill-switch."),
+    trigger: bool = typer.Option(False, "--trigger", help="Arma manualmente (parar trading)."),
+    reason: str = typer.Option("manual", "--reason", help="Motivo (registrado no arquivo)."),
+) -> None:
+    """Gerencia kill-switch (arma/desarma).
+
+    Sem flags: so mostra status. Com --reset: desarma. Com --trigger:
+    arma. So um por chamada.
+    """
+    from bot.config.settings import get_settings
+    from bot.risk.kill_switch import KillSwitch
+
+    if reset and trigger:
+        typer.echo("Use apenas --reset ou --trigger, nao ambos.")
+        raise typer.Exit(code=1)
+
+    settings = get_settings()
+    ks = KillSwitch(settings.kill_switch_path)
+
+    if reset:
+        if not ks.is_active():
+            typer.echo("Kill-switch ja esta desarmado.")
+            return
+        ks.reset()
+        typer.echo("Kill-switch DESARMADO.")
+        return
+
+    if trigger:
+        ks.trigger(reason)
+        typer.echo(f"Kill-switch ARMADO. razao: {reason}")
+        return
+
+    if ks.is_active():
+        typer.echo(f"Kill-switch ATIVO. Razao: {ks.reason()}")
+    else:
+        typer.echo("Kill-switch desarmado.")
+
+
+@app.command(name="live")
+def live_cmd(
+    min_volume: float = typer.Option(10000.0, "--min-volume"),
+    max_markets: int = typer.Option(20, "--max-markets"),
+    max_pages: int = typer.Option(5, "--max-pages"),
+    interval: float = typer.Option(5.0, "--interval"),
+    confirm: bool = typer.Option(
+        False, "--i-confirm-real-money", help="Pula prompt interativo (CI)."
+    ),
+    one_shot: bool = typer.Option(
+        False, "--one-shot", help="Roda uma passada e sai (em vez de loop)."
+    ),
+) -> None:
+    """EXECUCAO REAL: detecta + executa arbs com capital de verdade.
+
+    Antes de rodar:
+    1. Configure .env com POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS, POLY_API_*.
+    2. Confira `bot risk-status` - limites batem com seu apetite?
+    3. Comece com LIVE_MAX_CAPITAL_PER_TRADE_USDC pequeno (5-10).
+    """
+    import asyncio as _asyncio
+
+    from bot.clients.polymarket_clob import ClobClient
+    from bot.clients.polymarket_gamma import GammaClient
+    from bot.config.settings import get_settings
+    from bot.data.opportunity_store import OpportunityStore
+    from bot.economics.cost_model import CostModel
+    from bot.execution.live_client import PolymarketLiveClient
+    from bot.execution.live_trader import LiveTrader
+    from bot.risk.kill_switch import KillSwitch
+    from bot.risk.limits import RiskManager
+    from bot.strategies.intra_market import IntraMarketDetector
+    from bot.strategies.scanner import IntraMarketScanner, format_opportunity_line
+
+    settings = get_settings()
+
+    if not settings.wallet_configured:
+        typer.echo("ERRO: POLY_PRIVATE_KEY ou POLY_FUNDER_ADDRESS nao configurado em .env")
+        raise typer.Exit(code=1)
+
+    typer.echo("======================================================")
+    typer.echo("  ATENCAO: MODO LIVE - dinheiro real sera utilizado.")
+    typer.echo("======================================================")
+    typer.echo(f"  Carteira (funder)  : {settings.poly_funder_address}")
+    typer.echo(f"  Capital/trade max  : ${settings.live_max_capital_per_trade_usdc}")
+    typer.echo(f"  Hard cap/trade     : ${settings.live_capital_hard_cap_usdc}")
+    typer.echo(f"  Exposure max       : ${settings.live_max_open_exposure_usdc}")
+    typer.echo(f"  Daily loss limit   : ${settings.live_max_daily_loss_usdc}")
+    typer.echo(f"  Min saldo USDC     : ${settings.live_min_usdc_balance}")
+    typer.echo(f"  Threshold lucro    : {settings.min_net_profit_pct}%")
+
+    if not confirm:
+        typer.echo("")
+        typer.echo(f"Pra continuar, digite EXATAMENTE: {CONFIRM_PHRASE}")
+        entered = input("> ").strip()
+        if entered != CONFIRM_PHRASE:
+            typer.echo("Frase incorreta. Abortando.")
+            raise typer.Exit(code=1)
+
+    cost_model = CostModel.from_settings(settings)
+    detector = IntraMarketDetector(cost_model, min_net_profit_pct=settings.min_net_profit_pct)
+    store = OpportunityStore(settings.database_path)
+    store.init_schema()
+    kill_switch = KillSwitch(settings.kill_switch_path)
+    risk_manager = RiskManager.from_settings(settings, kill_switch)
+
+    if kill_switch.is_active():
+        typer.echo(f"Kill-switch ATIVO ({kill_switch.reason()}). Use `bot kill-switch --reset` antes.")
+        raise typer.Exit(code=2)
+
+    try:
+        live_client = PolymarketLiveClient(
+            host=settings.poly_clob_host,
+            chain_id=settings.poly_chain_id,
+            private_key=settings.poly_private_key,
+            funder=settings.poly_funder_address,
+            signature_type=settings.poly_signature_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"ERRO ao inicializar PolymarketLiveClient: {exc}")
+        raise typer.Exit(code=3) from exc
+
+    trader = LiveTrader(
+        live_client,
+        cost_model,
+        store,
+        risk_manager,
+        capital_per_trade_usdc=settings.live_max_capital_per_trade_usdc,
+    )
+
+    async def _run() -> None:
+        async with GammaClient() as gamma, ClobClient() as clob:
+            scanner = IntraMarketScanner(gamma, clob, detector, store)
+            await scanner.refresh_cache(min_volume=min_volume, max_pages=max_pages)
+            typer.echo(f"  mercados ativos: {len(scanner.cache.markets)}")
+
+            pass_num = 0
+            try:
+                while True:
+                    pass_num += 1
+                    if kill_switch.is_active():
+                        typer.echo(
+                            f"[#{pass_num:04d}] kill-switch acionado: {kill_switch.reason()}"
+                        )
+                        break
+                    result = await scanner.scan_once(max_markets=max_markets)
+                    if result.opportunities:
+                        result.opportunities.sort(
+                            key=lambda o: o.net_pnl_pct, reverse=True
+                        )
+                        best = result.opportunities[0]
+                        typer.echo(
+                            f"[#{pass_num:04d}] {result.opportunities_found} arbs - executando best:"
+                        )
+                        typer.echo(format_opportunity_line(best))
+                        outcome = await trader.execute(best)
+                        if outcome.submitted and outcome.trade is not None:
+                            t = outcome.trade
+                            typer.echo(
+                                f"  -> {t.leg_status} net=${t.net_pnl_usdc:.2f} "
+                                f"matched={t.matched_shares:.2f}"
+                            )
+                        else:
+                            typer.echo(f"  -> rejeitado: {outcome.risk_reason}")
+                    else:
+                        typer.echo(
+                            f"[#{pass_num:04d}] nenhuma arb (varridos {result.markets_scanned})"
+                        )
+                    if one_shot:
+                        break
+                    await _asyncio.sleep(interval)
+            except (KeyboardInterrupt, _asyncio.CancelledError):
+                typer.echo("\nLive encerrado.")
+
+    try:
+        _asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+
+
 if __name__ == "__main__":
     app()

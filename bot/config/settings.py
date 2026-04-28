@@ -38,6 +38,19 @@ class Settings(BaseSettings):
 
     paper_capital_per_trade_usdc: float = Field(default=20.0, ge=1.0)
 
+    # Fase 5 - execucao real e risco
+    poly_signature_type: int = Field(default=0, ge=0, le=2)
+    poly_chain_id: int = Field(default=137, ge=1)
+    poly_clob_host: str = "https://clob.polymarket.com"
+
+    live_max_capital_per_trade_usdc: float = Field(default=5.0, ge=1.0)
+    live_max_open_exposure_usdc: float = Field(default=20.0, ge=1.0)
+    live_max_daily_loss_usdc: float = Field(default=10.0, ge=0.0)
+    live_min_usdc_balance: float = Field(default=10.0, ge=0.0)
+    live_capital_hard_cap_usdc: float = Field(default=50.0, ge=1.0)
+
+    kill_switch_path: Path = Path("data/KILL_SWITCH")
+
     log_level: str = "INFO"
     database_path: Path = Path("data/bot.db")
 
