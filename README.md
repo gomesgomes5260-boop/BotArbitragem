@@ -70,6 +70,26 @@ bot/
 tests/
 ```
 
+## Rodar paper trading 24/7 (VPS)
+
+Apos o `setup_vps.sh`, instala o service do monitor:
+
+```bash
+INSTALL_PAPER_MONITOR=1 bash scripts/setup_vps.sh
+sudo systemctl enable --now bot-paper-monitor
+sudo journalctl -u bot-paper-monitor -f         # tail dos logs
+sudo systemctl status bot-paper-monitor         # status atual
+```
+
+O service roda `bot monitor --paper --interval 5` e reinicia em caso de falha. Sobrevive a reboot do VPS.
+
+Apos rodar por algumas horas:
+
+```bash
+.venv/bin/bot pnl --period 1d --mode paper      # P&L do dia
+.venv/bin/bot stats                              # oportunidades detectadas
+```
+
 ## Dashboard no Notion
 
 Sync periodico do estado do bot (trades, oportunidades, P&L diario, top mercados) pra uma pagina Notion. Foco em analise de profit. Renderiza em-place a cada `NOTION_SYNC_INTERVAL_SECONDS` (default 15min).

@@ -65,6 +65,25 @@ echo "==> Rodando testes pra confirmar setup..."
 .venv/bin/pytest -q
 
 # -----------------------------------------------------------------
+# Paper monitor service (opcional, ativa com INSTALL_PAPER_MONITOR=1)
+# -----------------------------------------------------------------
+if [ "${INSTALL_PAPER_MONITOR:-0}" = "1" ]; then
+    echo "==> Instalando systemd service do paper monitor..."
+    PMS_FILE="/etc/systemd/system/bot-paper-monitor.service"
+    PMS_USER="${SUDO_USER:-$(whoami)}"
+    sed \
+        -e "s|__USER__|${PMS_USER}|g" \
+        -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
+        "${INSTALL_DIR}/scripts/bot-paper-monitor.service" \
+        | $SUDO tee "$PMS_FILE" > /dev/null
+    $SUDO systemctl daemon-reload
+    echo "    Service instalado em $PMS_FILE."
+    echo "    Para ativar:"
+    echo "      $SUDO systemctl enable --now bot-paper-monitor"
+    echo "      $SUDO journalctl -u bot-paper-monitor -f"
+fi
+
+# -----------------------------------------------------------------
 # Notion sync service (opcional, ativa com INSTALL_NOTION_SYNC=1)
 # -----------------------------------------------------------------
 if [ "${INSTALL_NOTION_SYNC:-0}" = "1" ]; then
