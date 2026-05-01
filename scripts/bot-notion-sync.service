@@ -1,0 +1,19 @@
+[Unit]
+Description=BotArbitragem Notion dashboard sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=__INSTALL_DIR__/.env
+ExecStart=__INSTALL_DIR__/.venv/bin/python -m bot.cli notion-sync
+Restart=on-failure
+RestartSec=30
+# Falha consecutiva nao fica em loop apertado:
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

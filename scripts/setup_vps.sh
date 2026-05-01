@@ -2,7 +2,7 @@
 # Setup do bot de arbitragem em VPS Ubuntu 24.04+ (DigitalOcean, Hetzner, etc).
 #
 # Uso (no SSH do VPS, como root):
-#   curl -fsSL https://raw.githubusercontent.com/gomesgomes5260-boop/BotArbitragem/claude/polymarket-arbitrage-bot-sQuq8/scripts/setup_vps.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/gomesgomes5260-boop/BotArbitragem/claude/polymarket-arbitrage-bot-1odkJ/scripts/setup_vps.sh | bash
 #
 # O que faz:
 # 1. Atualiza apt e instala python3, venv, pip, git, tmux
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/gomesgomes5260-boop/BotArbitragem.git"
-BRANCH="claude/polymarket-arbitrage-bot-sQuq8"
+BRANCH="claude/polymarket-arbitrage-bot-1odkJ"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/BotArbitragem}"
 
 if [ "$EUID" -eq 0 ]; then
@@ -64,6 +64,25 @@ fi
 echo "==> Rodando testes pra confirmar setup..."
 .venv/bin/pytest -q
 
+# -----------------------------------------------------------------
+# Notion sync service (opcional, ativa com INSTALL_NOTION_SYNC=1)
+# -----------------------------------------------------------------
+if [ "${INSTALL_NOTION_SYNC:-0}" = "1" ]; then
+    echo "==> Instalando systemd service para sync do Notion..."
+    SERVICE_FILE="/etc/systemd/system/bot-notion-sync.service"
+    SERVICE_USER="${SUDO_USER:-$(whoami)}"
+    sed \
+        -e "s|__USER__|${SERVICE_USER}|g" \
+        -e "s|__INSTALL_DIR__|${INSTALL_DIR}|g" \
+        "${INSTALL_DIR}/scripts/bot-notion-sync.service" \
+        | $SUDO tee "$SERVICE_FILE" > /dev/null
+    $SUDO systemctl daemon-reload
+    echo "    Service instalado em $SERVICE_FILE."
+    echo "    Para ativar (depois de configurar NOTION_* no .env):"
+    echo "      $SUDO systemctl enable --now bot-notion-sync"
+    echo "      $SUDO journalctl -u bot-notion-sync -f"
+fi
+
 echo ""
 echo "================================================================"
 echo "  SETUP COMPLETO. Proximos passos:"
@@ -83,6 +102,14 @@ echo "  # tmux attach -t bot  =  reconecta a qualquer hora"
 echo ""
 echo "  # 3) Apos 48-72h, conferir resultado:"
 echo "  python -m bot.cli pnl --period 7d --mode paper"
+echo ""
+echo "  # 4) Dashboard no Notion (opcional):"
+echo "  #    a) Cole NOTION_TOKEN no .env"
+echo "  #    b) Crie pagina parent no Notion + connect a integracao Claude/Notion"
+echo "  #    c) Bootstrap: python -m bot.cli notion-bootstrap --parent-page-id XXX"
+echo "  #    d) Cole os 3 IDs retornados no .env"
+echo "  #    e) Service: INSTALL_NOTION_SYNC=1 bash scripts/setup_vps.sh"
+echo "  #       sudo systemctl enable --now bot-notion-sync"
 echo ""
 echo "  Edite .env so se quiser mudar limites (paper roda com defaults)."
 echo "================================================================"
