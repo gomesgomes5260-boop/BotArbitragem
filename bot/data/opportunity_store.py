@@ -16,7 +16,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
@@ -82,6 +82,12 @@ CREATE TABLE IF NOT EXISTS daily_costs (
 CREATE TABLE IF NOT EXISTS matic_price_history (
     date TEXT PRIMARY KEY,
     price_usd REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notion_sync_state (
+    entity TEXT PRIMARY KEY,
+    last_synced_id INTEGER NOT NULL DEFAULT 0,
+    last_synced_at_utc TEXT
 );
 """
 
@@ -343,6 +349,129 @@ class OpportunityStore:
                 "SELECT * FROM opportunities ORDER BY id DESC LIMIT ?", (limit,)
             )
             return list(cur.fetchall())
+
+    # ---- Notion sync state ----
+    def get_notion_sync_cursor(self, entity: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT last_synced_id FROM notion_sync_state WHERE entity = ?",
+                (entity,),
+            )
+            row = cur.fetchone()
+            return int(row["last_synced_id"]) if row else 0
+
+    def set_notion_sync_cursor(self, entity: str, last_synced_id: int) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO notion_sync_state (entity, last_synced_id, last_synced_at_utc)
+                VALUES (?, ?, ?)
+                ON CONFLICT(entity) DO UPDATE SET
+                    last_synced_id = excluded.last_synced_id,
+                    last_synced_at_utc = excluded.last_synced_at_utc
+                """,
+                (entity, last_synced_id, ts),
+            )
+
+    def trades_after_id(self, after_id: int, *, limit: int) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM trades WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (after_id, limit),
+            )
+            return list(cur.fetchall())
+
+    def opportunities_after_id(self, after_id: int, *, limit: int) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM opportunities WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (after_id, limit),
+            )
+            return list(cur.fetchall())
+
+    def daily_pnl_series(self, *, days: int = 30, mode: str | None = None) -> list[dict]:
+        """Soma diaria de net_pnl/gross/fees/gas/n agrupada por dia UTC."""
+        clauses: list[str] = ["timestamp_utc >= ?"]
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        params: list = [since]
+        if mode is not None:
+            clauses.append("mode = ?")
+            params.append(mode)
+        where = "WHERE " + " AND ".join(clauses)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"""
+                SELECT
+                    substr(timestamp_utc, 1, 10) AS day,
+                    COUNT(*) AS n,
+                    COALESCE(SUM(realized_gross_pnl_usdc), 0) AS gross,
+                    COALESCE(SUM(taker_fee_paid_usdc), 0) AS taker_fees,
+                    COALESCE(SUM(maker_fee_paid_usdc), 0) AS maker_fees,
+                    COALESCE(SUM(gas_paid_usdc), 0) AS gas,
+                    COALESCE(SUM(net_pnl_usdc), 0) AS net,
+                    COALESCE(SUM(size_usdc), 0) AS notional,
+                    SUM(CASE WHEN net_pnl_usdc > 0 THEN 1 ELSE 0 END) AS wins
+                FROM trades {where}
+                GROUP BY day
+                ORDER BY day ASC
+                """,
+                params,
+            )
+            return [
+                {
+                    "day": r["day"],
+                    "num_trades": int(r["n"]),
+                    "gross_pnl": float(r["gross"]),
+                    "fees": float(r["taker_fees"]) + float(r["maker_fees"]),
+                    "gas": float(r["gas"]),
+                    "net_pnl": float(r["net"]),
+                    "notional": float(r["notional"]),
+                    "wins": int(r["wins"] or 0),
+                }
+                for r in cur.fetchall()
+            ]
+
+    def top_markets_by_pnl(
+        self, *, days: int = 30, mode: str | None = None, limit: int = 5
+    ) -> list[dict]:
+        clauses: list[str] = ["t.timestamp_utc >= ?"]
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        params: list = [since]
+        if mode is not None:
+            clauses.append("t.mode = ?")
+            params.append(mode)
+        where = "WHERE " + " AND ".join(clauses)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"""
+                SELECT
+                    t.market_id AS market_id,
+                    COALESCE(o.market_question, t.market_id) AS question,
+                    COUNT(*) AS n,
+                    COALESCE(SUM(t.realized_gross_pnl_usdc), 0) AS gross,
+                    COALESCE(SUM(t.net_pnl_usdc), 0) AS net,
+                    COALESCE(SUM(t.size_usdc), 0) AS notional
+                FROM trades t
+                LEFT JOIN opportunities o ON o.id = t.opportunity_id
+                {where}
+                GROUP BY t.market_id
+                ORDER BY net DESC
+                LIMIT ?
+                """,
+                params + [limit],
+            )
+            return [
+                {
+                    "market_id": r["market_id"],
+                    "question": r["question"],
+                    "num_trades": int(r["n"]),
+                    "gross_pnl": float(r["gross"]),
+                    "net_pnl": float(r["net"]),
+                    "notional": float(r["notional"]),
+                }
+                for r in cur.fetchall()
+            ]
 
     def aggregate_pnl(self, *, since_iso: str | None = None) -> dict[str, float | int]:
         """Soma simples de lucro detectado (so observacao). Para P&L de

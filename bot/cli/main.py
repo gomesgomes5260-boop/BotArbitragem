@@ -741,5 +741,194 @@ def live_cmd(
         pass
 
 
+@app.command(name="notion-sync")
+def notion_sync_cmd(
+    once: bool = typer.Option(
+        False, "--once", help="Executa um sync e sai (sem loop)."
+    ),
+    interval: int = typer.Option(
+        0,
+        "--interval",
+        help="Segundos entre syncs em modo loop. 0 = usar NOTION_SYNC_INTERVAL_SECONDS.",
+    ),
+) -> None:
+    """Sincroniza estado do bot (SQLite) para o Notion: trades, opps e dashboard.
+
+    Modo padrao: loop infinito ate Ctrl+C. Use --once para um unico sync
+    (util pra cron ou debug).
+    """
+    import asyncio as _asyncio
+
+    from bot.config.settings import get_settings
+    from bot.data.opportunity_store import OpportunityStore
+    from bot.economics.cost_model import CostModel
+    from bot.monitoring.notion_client import NotionClient
+    from bot.monitoring.notion_reporter import NotionReporter
+
+    s = get_settings()
+    if not s.notion_configured:
+        typer.echo("ERRO: Notion nao configurado. Defina no .env:", err=True)
+        typer.echo("  NOTION_TOKEN, NOTION_DASHBOARD_PAGE_ID,", err=True)
+        typer.echo("  NOTION_TRADES_DB_ID, NOTION_OPPORTUNITIES_DB_ID", err=True)
+        typer.echo("Use `bot notion-bootstrap` para criar a estrutura.", err=True)
+        raise typer.Exit(code=2)
+
+    store = OpportunityStore(s.database_path)
+    store.init_schema()
+    cost_model = CostModel.from_settings(s)
+    interval_s = interval if interval > 0 else s.notion_sync_interval_seconds
+
+    async def _run() -> None:
+        async with NotionClient(
+            s.notion_token,  # type: ignore[arg-type]
+            api_version=s.notion_api_version,
+            api_base=s.notion_api_base,
+        ) as client:
+            reporter = NotionReporter(
+                store,
+                cost_model,
+                client,
+                dashboard_page_id=s.notion_dashboard_page_id,  # type: ignore[arg-type]
+                trades_db_id=s.notion_trades_db_id,  # type: ignore[arg-type]
+                opportunities_db_id=s.notion_opportunities_db_id,  # type: ignore[arg-type]
+                max_rows_per_run=s.notion_sync_max_rows_per_run,
+            )
+            try:
+                while True:
+                    res = await reporter.sync_once()
+                    typer.echo(
+                        f"sync ok: trades+{res.trades_synced} "
+                        f"opps+{res.opportunities_synced} "
+                        f"dashboard={'sim' if res.dashboard_updated else 'NAO'} "
+                        f"erros={len(res.errors)}"
+                    )
+                    for err in res.errors:
+                        typer.echo(f"  ! {err}", err=True)
+                    if once:
+                        break
+                    await _asyncio.sleep(interval_s)
+            except (KeyboardInterrupt, _asyncio.CancelledError):
+                typer.echo("\nNotion sync encerrado.")
+
+    try:
+        _asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+
+
+@app.command(name="notion-bootstrap")
+def notion_bootstrap_cmd(
+    parent_page_id: str = typer.Option(
+        ...,
+        "--parent-page-id",
+        help="ID da pagina parent no Notion onde criar Dashboard + databases.",
+    ),
+) -> None:
+    """Cria Dashboard, Trades DB e Opportunities DB sob a pagina informada.
+
+    Imprime os IDs no final pra voce colar no .env. NAO grava o .env automaticamente.
+    """
+    import asyncio as _asyncio
+
+    from bot.config.settings import get_settings
+    from bot.monitoring.notion_client import NotionClient
+
+    s = get_settings()
+    if not s.notion_token:
+        typer.echo("ERRO: NOTION_TOKEN nao definido no .env.", err=True)
+        raise typer.Exit(code=2)
+
+    parent_clean = parent_page_id.replace("-", "")
+
+    trades_props = {
+        "Name": {"title": {}},
+        "Trade ID": {"number": {}},
+        "Date": {"date": {}},
+        "Mode": {
+            "select": {
+                "options": [
+                    {"name": "paper", "color": "blue"},
+                    {"name": "live", "color": "red"},
+                ]
+            }
+        },
+        "Market ID": {"rich_text": {}},
+        "Question": {"rich_text": {}},
+        "Size USDC": {"number": {"format": "dollar"}},
+        "Gross PnL": {"number": {"format": "dollar"}},
+        "Net PnL": {"number": {"format": "dollar"}},
+        "Fees": {"number": {"format": "dollar"}},
+        "Gas": {"number": {"format": "dollar"}},
+        "Fill YES": {"number": {"format": "number"}},
+        "Fill NO": {"number": {"format": "number"}},
+        "Status": {
+            "select": {
+                "options": [
+                    {"name": "both_filled", "color": "green"},
+                    {"name": "partial_yes", "color": "yellow"},
+                    {"name": "partial_no", "color": "yellow"},
+                    {"name": "failed", "color": "red"},
+                ]
+            }
+        },
+    }
+    opps_props = {
+        "Name": {"title": {}},
+        "Opp ID": {"number": {}},
+        "Date": {"date": {}},
+        "Market ID": {"rich_text": {}},
+        "Question": {"rich_text": {}},
+        "Ask YES": {"number": {"format": "number"}},
+        "Ask NO": {"number": {"format": "number"}},
+        "Sum Asks": {"number": {"format": "number"}},
+        "Size Max USDC": {"number": {"format": "dollar"}},
+        "Gross PnL": {"number": {"format": "dollar"}},
+        "Est Fees": {"number": {"format": "dollar"}},
+        "Est Gas": {"number": {"format": "dollar"}},
+        "Net PnL": {"number": {"format": "dollar"}},
+        "Net PnL %": {"number": {"format": "percent"}},
+        "Was Traded": {"checkbox": {}},
+    }
+    dash_placeholder = [
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": "Aguardando primeiro sync... rode `bot notion-sync --once`."
+                        },
+                    }
+                ]
+            },
+        }
+    ]
+
+    async def _run() -> None:
+        async with NotionClient(
+            s.notion_token,  # type: ignore[arg-type]
+            api_version=s.notion_api_version,
+            api_base=s.notion_api_base,
+        ) as client:
+            trades_db = await client.create_database(
+                parent_clean, "Trades", trades_props
+            )
+            opps_db = await client.create_database(
+                parent_clean, "Opportunities", opps_props
+            )
+            dash = await client.create_subpage(
+                parent_clean, "Dashboard", emoji="📊", children=dash_placeholder
+            )
+
+            typer.echo("\n== IDs criados (cole no .env) ==\n")
+            typer.echo(f"NOTION_TRADES_DB_ID={trades_db['id']}")
+            typer.echo(f"NOTION_OPPORTUNITIES_DB_ID={opps_db['id']}")
+            typer.echo(f"NOTION_DASHBOARD_PAGE_ID={dash['id']}")
+
+    _asyncio.run(_run())
+
+
 if __name__ == "__main__":
     app()

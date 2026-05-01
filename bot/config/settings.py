@@ -51,6 +51,16 @@ class Settings(BaseSettings):
 
     kill_switch_path: Path = Path("data/KILL_SWITCH")
 
+    # Notion dashboard sync
+    notion_token: str | None = None
+    notion_dashboard_page_id: str | None = None
+    notion_trades_db_id: str | None = None
+    notion_opportunities_db_id: str | None = None
+    notion_sync_interval_seconds: int = Field(default=900, ge=30)
+    notion_sync_max_rows_per_run: int = Field(default=50, ge=1, le=500)
+    notion_api_version: str = "2022-06-28"
+    notion_api_base: str = "https://api.notion.com/v1"
+
     log_level: str = "INFO"
     database_path: Path = Path("data/bot.db")
 
@@ -62,6 +72,15 @@ class Settings(BaseSettings):
     def api_configured(self) -> bool:
         return bool(
             self.poly_api_key and self.poly_api_secret and self.poly_api_passphrase
+        )
+
+    @property
+    def notion_configured(self) -> bool:
+        return bool(
+            self.notion_token
+            and self.notion_dashboard_page_id
+            and self.notion_trades_db_id
+            and self.notion_opportunities_db_id
         )
 
     @property
